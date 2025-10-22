@@ -1,5 +1,10 @@
 # Configuration file (may contain sensitive info)
 mail_config.json
+*.log
+
+# Performance cache files
+.message_id_cache.json
+.email_body_index.json
 
 # Python cache
 __pycache__/

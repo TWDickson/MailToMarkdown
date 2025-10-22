@@ -1,0 +1,26 @@
+{
+  "email": "your-email@example.com",
+  "imap_server": "imap.example.com",
+  "imap_port": 993,
+  "imap_folders": [
+    "INBOX",
+    "Important/Work"
+  ],
+  "include_related_sent": true,
+  "remove_quotes": true,
+  "output_dir": "export",
+  "pattern_detection": {
+    "comment": "Custom pattern detection settings (optional)",
+    "custom_reply_patterns": [
+      "^From:.+\\nSent:.+",
+      "^___+\\s*Original Message\\s*___+"
+    ],
+    "custom_forward_patterns": [
+      "^\\*\\*\\* Forwarded by .+\\*\\*\\*"
+    ],
+    "custom_signature_patterns": [
+      "^Warm regards,?\\s*$",
+      "^Cordially,?\\s*$"
+    ]
+  }
+}

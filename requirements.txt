@@ -2,3 +2,4 @@ markdownify
 html2text
 tqdm
 keyring
+pymarkdownlnt
