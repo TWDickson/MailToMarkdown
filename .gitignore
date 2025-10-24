@@ -13,6 +13,13 @@ __pycache__/
 *.so
 .Python
 
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+
 # Virtual environments
 venv/
 env/
