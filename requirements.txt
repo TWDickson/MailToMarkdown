@@ -1,5 +1,12 @@
+# Core dependencies
 markdownify
 html2text
 tqdm
 keyring
+
+# Optional dependencies
 pymarkdownlnt
+
+# Development dependencies
+pytest>=7.0.0
+pytest-cov

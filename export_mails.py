@@ -8,6 +8,7 @@ import json
 import sys
 import signal
 import logging
+import argparse
 from getpass import getpass
 from tqdm import tqdm
 import keyring
@@ -1686,14 +1687,16 @@ def regenerate_all_markdown(
     return exported
 
 
-def export_to_json(markdown_dir: str, output_file: str, compressed: bool = True):
+def export_to_json(markdown_dir: str, output_file: str, compressed: bool = False):
     """
     Export markdown emails to JSON format.
+
+    Data structure: Emails stored once, threads reference by ID (no duplication).
 
     Args:
         markdown_dir: Directory containing markdown files
         output_file: Output JSON file path
-        compressed: If True, use compressed format (no duplication). If False, include both threads and chronological.
+        compressed: If True, minify JSON (single line). If False, pretty-print with indentation (default).
 
     Returns:
         Number of emails exported
@@ -1702,7 +1705,7 @@ def export_to_json(markdown_dir: str, output_file: str, compressed: bool = True)
     from pathlib import Path
     from collections import defaultdict
 
-    print(f"\n[Markdown] Exporting markdown to JSON{'(compressed)' if compressed else ''}...\n")
+    print(f"\n[Markdown] Exporting markdown to JSON {'(minified)' if compressed else '(pretty-printed)'}...\n")
 
     md_files = sorted(glob.glob(os.path.join(markdown_dir, '*.md')))
 
@@ -1797,19 +1800,13 @@ def export_to_json(markdown_dir: str, output_file: str, compressed: bool = True)
         }
 
         emails.append(email_data)
-        threads[base_subject].append(email_data['id'] if compressed else email_data)
+        threads[base_subject].append(email_data['id'])  # Always store IDs
 
     # Build thread summaries
     thread_summaries = []
     for subject, thread_items in threads.items():
-        if compressed:
-            # thread_items contains IDs
-            thread_emails = [emails[i] for i in thread_items]
-            email_ids = thread_items
-        else:
-            # thread_items contains full email objects
-            thread_emails = thread_items
-            email_ids = None
+        # thread_items always contains IDs
+        thread_emails = [emails[i] for i in thread_items]
 
         participants = sorted(list(set(e['from'] for e in thread_emails if e['from'])))
 
@@ -1820,15 +1817,13 @@ def export_to_json(markdown_dir: str, output_file: str, compressed: bool = True)
             'dates': {
                 'first': thread_emails[0]['date'],
                 'last': thread_emails[-1]['date']
-            }
+            },
+            'emails': thread_items  # Always use IDs
         }
-
-        if compressed:
-            thread_summary['emails'] = email_ids  # Just IDs
 
         thread_summaries.append(thread_summary)
 
-    # Build output structure
+    # Build output structure (always same structure, compressed only affects formatting)
     output = {
         'summary': {
             'emails': len(emails),
@@ -1840,17 +1835,13 @@ def export_to_json(markdown_dir: str, output_file: str, compressed: bool = True)
         'emails': emails
     }
 
-    # Add full thread data if not compressed
-    if not compressed:
-        output['threads_full'] = {subject: items for subject, items in threads.items()}
-
     # Write JSON
     with open(output_file, 'w', encoding='utf-8') as f:
         if compressed:
-            # Compressed: minimal whitespace
+            # Minified: single line, minimal whitespace
             json.dump(output, f, ensure_ascii=False, separators=(',', ':'))
         else:
-            # Full: readable with indentation
+            # Pretty-printed: indented, human-readable
             json.dump(output, f, indent=2, ensure_ascii=False)
 
     file_size = os.path.getsize(output_file)
@@ -1860,8 +1851,103 @@ def export_to_json(markdown_dir: str, output_file: str, compressed: bool = True)
     return len(emails)
 
 
+def write_json_documentation(output_dir: str):
+    """Write JSON structure and search guide documentation files."""
+
+    json_structure = """# JSON Structure
+
+## Schema
+```json
+{
+  "summary": {
+    "emails": number,
+    "threads": number,
+    "attachments": number,
+    "participants": [string]
+  },
+  "threads": [{
+    "subject": string,        // Normalized (Re:/Fwd: removed)
+    "count": number,
+    "participants": [string],
+    "dates": {"first": string, "last": string},  // ISO 8601
+    "emails": [number]        // IDs referencing emails array
+  }],
+  "emails": [{
+    "id": number,
+    "from": string,
+    "to": string,
+    "cc": string,
+    "date": string,           // ISO 8601
+    "subject": string,        // Original (includes Re:/Fwd:)
+    "body": string,
+    "attachments": [{
+      "name": string,
+      "path": string,
+      "size": number,
+      "ext": string
+    }],
+    "thread": string          // Normalized subject
+  }]
+}
+```
+
+## Key Points
+- **No duplication**: Emails stored once, threads reference by ID
+- **Pre-sorted**: Threads by count (desc), emails chronologically
+- **Lookup pattern**: threads → email IDs → emails[id]
+- **Images/eml files**: Excluded from attachments
+"""
+
+    search_guide = """# Search Guide
+
+## Strategy: Top-Down Approach
+1. Check `summary` for overview (counts, participants)
+2. Browse `threads[]` for relevant conversations (pre-sorted by activity)
+3. Look up specific emails via `emails[id]`
+
+## Common Queries
+
+**By sender**: Filter `emails[]` where `from` matches
+**By topic**: Search `threads[].subject` first, then `emails[].body`
+**By date**: Parse `date` field (ISO 8601), filter by range
+**By attachments**: Filter where `attachments.length > 0`
+**Full thread**: Find in `threads[]`, get IDs from `emails[]`, map to `emails[id]`
+**Participants**: Use `thread.participants[]` or aggregate `from` fields
+**Most active**: `threads[0]` (already sorted by count desc)
+
+## Optimization Tips
+- Use thread metadata before loading full emails
+- `threads[]` sorted by count, `emails[]` by chronology
+- `summary.participants` avoids scanning all emails
+- Thread subjects normalized, email subjects original
+
+## Pitfalls
+- Don't confuse `thread.subject` (normalized) with `email.subject` (original)
+- Check both `to` and `cc` for participants
+- Images/eml excluded from attachments
+"""
+
+    # Write files
+    try:
+        with open(os.path.join(output_dir, 'JSON_STRUCTURE.md'), 'w', encoding='utf-8') as f:
+            f.write(json_structure)
+
+        with open(os.path.join(output_dir, 'CLAUDE_SEARCH_GUIDE.md'), 'w', encoding='utf-8') as f:
+            f.write(search_guide)
+
+        print(f"   [OK] Documentation written (JSON_STRUCTURE.md, CLAUDE_SEARCH_GUIDE.md)")
+    except Exception as e:
+        logger.warning(f"Failed to write documentation: {e}")
+
+
 def main():
     """Main function to run the email export tool."""
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Email Export Tool v2 (Sync + Raw + Markdown)')
+    parser.add_argument('--compress-json', action='store_true',
+                        help='Compress JSON export (smaller file size, emails referenced by ID)')
+    args = parser.parse_args()
+
     print("Email Export Tool v2 (Sync + Raw + Markdown)")
     print()
 
@@ -1883,7 +1969,7 @@ def main():
     print("  1. Sync new emails from IMAP (download only new/changed)")
     print("  2. Regenerate markdown from existing raw emails")
     print("  3. Both (sync + regenerate)")
-    print("  4. Export markdown to JSON (compressed format)")
+    print("  4. Export markdown to JSON")
     choice = input("\nChoice (1/2/3/4): ").strip()
     print()
 
@@ -1891,18 +1977,26 @@ def main():
 
     if choice == '4':
         # Export to JSON
-        json_file = os.path.join(config['output_dir'], 'emails_compressed.json')
-        email_count = export_to_json(markdown_dir, json_file, compressed=True)
+        json_file = os.path.join(config['output_dir'], 'emails.json')
+        email_count = export_to_json(markdown_dir, json_file, compressed=args.compress_json)
+
+        # Write documentation files
+        write_json_documentation(config['output_dir'])
 
         print("\n" + "=" * 60)
         print("JSON Export complete!")
         print("=" * 60)
         print(f"Emails exported: {email_count}")
         print(f"Output file: {json_file}")
-        print(f"\nFormat: Compressed (no duplication)")
+        print(f"\nStructure:")
         print(f"  - Emails stored once in 'emails' array")
-        print(f"  - Threads reference emails by ID")
-        print(f"  - Optimized for Claude analysis (~56K tokens)")
+        print(f"  - Threads reference emails by ID (no duplication)")
+        print(f"  - Optimized for LLM processing")
+        if args.compress_json:
+            print(f"\nFormatting: Minified (single line, smallest file size)")
+        else:
+            print(f"\nFormatting: Pretty-printed (indented, human-readable)")
+            print(f"Tip: Use --compress-json flag to minify output")
         print("\nTip: Upload this JSON to Claude for conversation analysis!")
         print("=" * 60)
         return 0
