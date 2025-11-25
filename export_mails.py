@@ -8,7 +8,6 @@ import json
 import sys
 import signal
 import logging
-import argparse
 from getpass import getpass
 from tqdm import tqdm
 import keyring
@@ -17,6 +16,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import html2text
 
 try:
     from pymarkdown.api import PyMarkdownApi, PyMarkdownApiException
@@ -697,19 +697,37 @@ def build_chronological_body_fingerprints(raw_emails_dir: str) -> dict:
                 # Get In-Reply-To
                 in_reply_to = msg.get("In-Reply-To", "")
 
-                # Extract plain text body
+                # Extract body text (prefer plain text, fall back to HTML conversion)
                 body_text = ""
+                html_body = ""
                 if msg.is_multipart():
                     for part in msg.walk():
-                        if part.get_content_type() == "text/plain":
+                        content_type = part.get_content_type()
+                        if content_type == "text/plain" and not body_text:
                             payload = part.get_payload(decode=True)
                             if payload and isinstance(payload, bytes):
                                 body_text = payload.decode(errors='ignore')
-                                break
+                        elif content_type == "text/html" and not html_body:
+                            payload = part.get_payload(decode=True)
+                            if payload and isinstance(payload, bytes):
+                                html_body = payload.decode(errors='ignore')
                 else:
+                    content_type = msg.get_content_type()
                     payload = msg.get_payload(decode=True)
                     if payload and isinstance(payload, bytes):
-                        body_text = payload.decode(errors='ignore')
+                        if content_type == "text/html":
+                            html_body = payload.decode(errors='ignore')
+                        else:
+                            body_text = payload.decode(errors='ignore')
+                
+                # If no plain text, convert HTML to text
+                if not body_text and html_body:
+                    h = html2text.HTML2Text()
+                    h.ignore_links = True
+                    h.ignore_images = True
+                    h.ignore_emphasis = True
+                    h.body_width = 0
+                    body_text = h.handle(html_body)
 
                 # Normalize body for matching (lowercase, remove extra whitespace)
                 normalized_body = re.sub(r'\s+', ' ', body_text.strip().lower())
@@ -794,7 +812,7 @@ def remove_quoted_content_by_fingerprint(email_body: str, message_id: str,
     """
     # Get metadata for current email
     if message_id not in fingerprints:
-        return email_body  # Can't process, return as-is
+        return email_body  # Can't process without fingerprint
 
     current_data = fingerprints[message_id]
     current_date_timestamp = current_data.get('date_timestamp', 0)
@@ -824,7 +842,7 @@ def remove_quoted_content_by_fingerprint(email_body: str, message_id: str,
                 })
 
     if not previous_emails:
-        return email_body  # No previous emails to check against
+        return email_body  # No previous emails to compare against
 
     # Sort by date (most recent first) to prioritize checking immediate parents
     previous_emails.sort(key=lambda x: x['timestamp'], reverse=True)
@@ -977,8 +995,13 @@ def remove_quoted_content_by_fingerprint(email_body: str, message_id: str,
 
 
 def extract_email_body_and_attachments(msg, attachments_dir):
-    """Extract email body and save attachments."""
-    body = ""
+    """Extract email body and save attachments.
+    
+    Prefers text/plain content, but falls back to converting text/html
+    if no plain text is available (e.g., HTML-only emails from iPhones).
+    """
+    plain_body = ""
+    html_body = ""
     attachment_paths = []
     attachment_count = 0
 
@@ -1019,7 +1042,27 @@ def extract_email_body_and_attachments(msg, attachments_dir):
             payload = part.get_payload(decode=True)
             if payload:
                 raw_body = payload.decode(errors="ignore")
-                body += raw_body
+                plain_body += raw_body
+        elif content_type == "text/html" and not plain_body:
+            # Only capture HTML if we don't have plain text yet
+            payload = part.get_payload(decode=True)
+            if payload:
+                html_body = payload.decode(errors="ignore")
+
+    # Prefer plain text, but convert HTML if that's all we have
+    if plain_body:
+        body = plain_body
+    elif html_body:
+        # Convert HTML to plain text using html2text
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = True
+        h.ignore_emphasis = False
+        h.body_width = 0  # Don't wrap lines
+        body = h.handle(html_body)
+        logger.debug(f"Converted HTML-only email to text ({len(html_body)} -> {len(body)} chars)")
+    else:
+        body = ""
 
     return body, attachment_paths, attachment_count
 
@@ -1942,12 +1985,6 @@ def write_json_documentation(output_dir: str):
 
 def main():
     """Main function to run the email export tool."""
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Email Export Tool v2 (Sync + Raw + Markdown)')
-    parser.add_argument('--compress-json', action='store_true',
-                        help='Compress JSON export (smaller file size, emails referenced by ID)')
-    args = parser.parse_args()
-
     print("Email Export Tool v2 (Sync + Raw + Markdown)")
     print()
 
@@ -1964,89 +2001,102 @@ def main():
     attachments_dir = os.path.join(config['output_dir'], "attachments")
     os.makedirs(attachments_dir, exist_ok=True)
 
-    # Ask what to do
-    print("What would you like to do?")
-    print("  1. Sync new emails from IMAP (download only new/changed)")
-    print("  2. Regenerate markdown from existing raw emails")
-    print("  3. Both (sync + regenerate)")
-    print("  4. Export markdown to JSON")
-    choice = input("\nChoice (1/2/3/4): ").strip()
-    print()
+    # Main menu loop
+    while True:
+        print("\nWhat would you like to do?")
+        print("  1. Sync new emails from IMAP (download only new/changed)")
+        print("  2. Regenerate markdown from existing raw emails")
+        print("  3. Both (sync + regenerate)")
+        print("  4. Export markdown to JSON")
+        print("  0. Exit")
+        choice = input("\nChoice (0/1/2/3/4): ").strip()
+        print()
 
-    downloaded_count = 0
+        if choice == '0':
+            print("Goodbye!")
+            return 0
 
-    if choice == '4':
-        # Export to JSON
-        json_file = os.path.join(config['output_dir'], 'emails.json')
-        email_count = export_to_json(markdown_dir, json_file, compressed=args.compress_json)
+        downloaded_count = 0
 
-        # Write documentation files
-        write_json_documentation(config['output_dir'])
+        if choice == '4':
+            # Ask about compression
+            compress_choice = input("Compress JSON? (smaller file, single line) (y/N): ").strip().lower()
+            compress = compress_choice == 'y'
+            
+            # Export to JSON
+            json_file = os.path.join(config['output_dir'], 'emails.json')
+            email_count = export_to_json(markdown_dir, json_file, compressed=compress)
 
-        print("\n" + "=" * 60)
-        print("JSON Export complete!")
-        print("=" * 60)
-        print(f"Emails exported: {email_count}")
-        print(f"Output file: {json_file}")
-        print(f"\nStructure:")
-        print(f"  - Emails stored once in 'emails' array")
-        print(f"  - Threads reference emails by ID (no duplication)")
-        print(f"  - Optimized for LLM processing")
-        if args.compress_json:
-            print(f"\nFormatting: Minified (single line, smallest file size)")
-        else:
-            print(f"\nFormatting: Pretty-printed (indented, human-readable)")
-            print(f"Tip: Use --compress-json flag to minify output")
-        print("\nTip: Upload this JSON to Claude for conversation analysis!")
-        print("=" * 60)
-        return 0
+            # Write documentation files
+            write_json_documentation(config['output_dir'])
 
-    if choice in ['1', '3']:
-        # Connect to server
-        try:
-            mail = imaplib.IMAP4_SSL(config['imap_server'], config['imap_port'])
-            mail.login(config['email'], config['password'])
-            print("[OK] Connected successfully.")
-        except Exception as e:
-            print(f"[Error] Connection failed: {e}")
-            return 1
+            print("\n" + "=" * 60)
+            print("JSON Export complete!")
+            print("=" * 60)
+            print(f"Emails exported: {email_count}")
+            print(f"Output file: {json_file}")
+            print("\nStructure:")
+            print("  - Emails stored once in 'emails' array")
+            print("  - Threads reference emails by ID (no duplication)")
+            print("  - Optimized for LLM processing")
+            if compress:
+                print("\nFormatting: Minified (single line, smallest file size)")
+            else:
+                print("\nFormatting: Pretty-printed (indented, human-readable)")
+            print("\nTip: Upload this JSON to Claude for conversation analysis!")
+            print("=" * 60)
+            continue  # Return to menu
 
-        # Sync emails (only download new ones)
-        downloaded = download_emails_from_imap(
-            mail, config['imap_folders'], raw_emails_dir,
-            include_sent_folder=config['include_related_sent']
-        )
+        if choice in ['1', '3']:
+            # Connect to server
+            try:
+                mail = imaplib.IMAP4_SSL(config['imap_server'], config['imap_port'])
+                mail.login(config['email'], config['password'])
+                print("[OK] Connected successfully.")
+            except Exception as e:
+                print(f"[Error] Connection failed: {e}")
+                continue  # Return to menu on error
 
-        mail.close()
-        mail.logout()
+            # Sync emails (only download new ones)
+            downloaded = download_emails_from_imap(
+                mail, config['imap_folders'], raw_emails_dir,
+                include_sent_folder=config['include_related_sent']
+            )
 
-        downloaded_count = len(downloaded)
-        print(f"[Download] Synced {downloaded_count} new emails\n")
+            mail.close()
+            mail.logout()
 
-    if choice in ['2', '3']:
-        # Regenerate markdown
-        exported_count = regenerate_all_markdown(
-            raw_emails_dir, markdown_dir, attachments_dir,
-            config['remove_quotes']
-        )
-    else:
-        exported_count = 0
+            downloaded_count = len(downloaded)
+            print(f"[Download] Synced {downloaded_count} new emails\n")
 
-    # Summary
-    print("\n" + "=" * 60)
-    print("Export complete!")
-    print("=" * 60)
-    if choice in ['1', '3']:
-        print(f"New emails downloaded: {downloaded_count}")
-    if choice in ['2', '3']:
-        print(f"Markdown files generated: {exported_count}")
-    print(f"Raw emails stored in: {raw_emails_dir}")
-    print("   (organized by folder: Important_Estate/, Sent/, etc.)")
-    print(f"Markdown output: {markdown_dir}")
-    print(f"Attachments: {attachments_dir}")
-    print("\nTip: Run option 2 to regenerate markdown after tweaking")
-    print("   quote removal logic - no need to re-download!")
-    print("=" * 60)
+        if choice in ['2', '3']:
+            # Regenerate markdown
+            exported_count = regenerate_all_markdown(
+                raw_emails_dir, markdown_dir, attachments_dir,
+                config['remove_quotes']
+            )
+        elif choice in ['1']:
+            exported_count = 0
+        elif choice not in ['1', '2', '3', '4']:
+            print("Invalid choice. Please enter 0, 1, 2, 3, or 4.")
+            continue
+
+        # Summary for options 1, 2, 3
+        if choice in ['1', '2', '3']:
+            print("\n" + "=" * 60)
+            print("Export complete!")
+            print("=" * 60)
+            if choice in ['1', '3']:
+                print(f"New emails downloaded: {downloaded_count}")
+            if choice in ['2', '3']:
+                print(f"Markdown files generated: {exported_count}")
+            print(f"Raw emails stored in: {raw_emails_dir}")
+            print("   (organized by folder: Important_Estate/, Sent/, etc.)")
+            print(f"Markdown output: {markdown_dir}")
+            print(f"Attachments: {attachments_dir}")
+            print("\nTip: Run option 2 to regenerate markdown after tweaking")
+            print("   quote removal logic - no need to re-download!")
+            print("=" * 60)
 
     return 0
 
